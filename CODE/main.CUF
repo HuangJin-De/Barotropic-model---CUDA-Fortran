@@ -1,0 +1,361 @@
+MODULE ini
+IMPLICIT NONE
+
+CONTAINS
+
+ATTRIBUTES(global) SUBROUTINE ic(q)
+IMPLICIT NONE
+
+INTEGER :: n(2)
+INTEGER :: i, j
+REAL :: l
+REAL :: q(:,:)
+
+i=(blockIdx%x-1)*blockDim%x+threadIdx%x
+j=(blockIdx%y-1)*blockDim%y+threadIdx%y
+n(1)=size(q,1)
+n(2)=size(q,2)
+
+IF (i<=n(1) .AND. j<=n(2)) THEN
+  l=sqrt((real(i-n(1)/2))**2+(real(j-n(2)/2))**2)
+  IF (l<=100.) q(i,j)=q(i,j)+5.E-5
+ENDIF
+
+END SUBROUTINE ic
+
+ATTRIBUTES(global) SUBROUTINE bc(q)
+IMPLICIT NONE
+
+INTEGER :: n(2)
+INTEGER :: i, j
+REAL :: q(:,:)
+
+i=(blockIdx%x-1)*blockDim%x+threadIdx%x
+j=(blockIdx%y-1)*blockDim%y+threadIdx%y
+n(1)=size(q,1)
+n(2)=size(q,2)
+
+! doubly periodic BC.
+IF (i==1 .AND. j>1 .AND. j<n(2)) q(i,j)=q(n(1)-1,j)
+IF (i==n(1) .AND. j>1 .AND. j<n(2)) q(i,j)=q(1+1,j)
+IF (j==1 .AND. i>1 .AND. i<n(1)) q(i,j)=q(i,n(2)-1)
+IF (j==n(2) .AND. i>1 .AND. i<n(1)) q(i,j)=q(i,1+1)
+
+IF (i==1 .AND. j==1) q(i,j)=q(n(1)-1,n(2)-1)
+IF (i==1 .AND. j==n(2)) q(i,j)=q(n(1)-1,2)
+IF (i==n(1) .AND. j==1) q(i,j)=q(2,n(2)-1)
+IF (i==n(1) .AND. j==n(2)) q(i,j)=q(2,2)
+
+END SUBROUTINE bc
+
+! for cufft
+ATTRIBUTES(global) SUBROUTINE r2c(r,c,halo)
+IMPLICIT NONE
+
+INTEGER, VALUE :: halo
+INTEGER :: n(2)
+INTEGER :: i, j
+REAL :: r(:,:)
+COMPLEX*16 :: c(:,:)
+
+i=(blockIdx%x-1)*blockDim%x+threadIdx%x
+j=(blockIdx%y-1)*blockDim%y+threadIdx%y
+n(1)=size(r,1)
+n(2)=size(r,2)
+
+IF (i<=n(1)-2*halo .AND. j<=n(2)-2*halo) c(i,j)=dcmplx(r(i+halo,j+halo),0.)
+
+END SUBROUTINE r2c
+
+ATTRIBUTES(global) SUBROUTINE c2r(c,r,halo)
+IMPLICIT NONE
+
+INTEGER, VALUE :: halo
+INTEGER :: n(2)
+INTEGER :: i, j
+REAL :: r(:,:)
+COMPLEX*16 :: c(:,:)
+
+i=(blockIdx%x-1)*blockDim%x+threadIdx%x
+j=(blockIdx%y-1)*blockDim%y+threadIdx%y
+n(1)=size(r,1)
+n(2)=size(r,2)
+
+IF (i<=n(1)-2*halo .AND. j<=n(2)-2*halo) r(i+halo,j+halo)=real(c(i,j))
+
+END SUBROUTINE c2r
+
+ATTRIBUTES(global) SUBROUTINE times(r,factor)
+IMPLICIT NONE
+
+REAL, VALUE :: factor
+INTEGER :: n(2)
+INTEGER :: i, j
+REAL :: r(:,:)
+
+i=(blockIdx%x-1)*blockDim%x+threadIdx%x
+j=(blockIdx%y-1)*blockDim%y+threadIdx%y
+n(1)=size(r,1)
+n(2)=size(r,2)
+
+IF (i<=n(1) .AND. j<=n(2)) r(i,j)=r(i,j)*factor 
+
+END SUBROUTINE times
+
+ATTRIBUTES(global) SUBROUTINE update(f,df,dt)
+IMPLICIT NONE
+
+REAL, VALUE :: dt
+INTEGER :: n(2)
+INTEGER :: i, j
+REAL :: f(:,:), df(:,:)
+
+i=(blockIdx%x-1)*blockDim%x+threadIdx%x
+j=(blockIdx%y-1)*blockDim%y+threadIdx%y
+n(1)=size(f,1)
+n(2)=size(f,2)
+
+IF (i<=n(1) .AND. j<=n(2)) f(i,j)=f(i,j)+dt*df(i,j)
+
+END SUBROUTINE update
+
+ATTRIBUTES(global) SUBROUTINE rk4_update(f,df,dt)
+IMPLICIT NONE
+
+REAL, VALUE :: dt
+INTEGER :: n(2)
+INTEGER :: i, j
+REAL :: f(:,:), df(:,:,:)
+
+i=(blockIdx%x-1)*blockDim%x+threadIdx%x
+j=(blockIdx%y-1)*blockDim%y+threadIdx%y
+n(1)=size(f,1)
+n(2)=size(f,2)
+
+IF (i<=n(1) .AND. j<=n(2)) f(i,j)=f(i,j)+dt*(df(i,j,1)+2.*df(i,j,2)+2.*df(i,j,3)+df(i,j,4))/6.
+
+END SUBROUTINE rk4_update
+
+END MODULE ini
+
+! ===============================
+
+MODULE solver
+IMPLICIT NONE
+
+REAL*8, PARAMETER :: pi=4.0D0*datan(1.0D0)
+
+CONTAINS
+
+ATTRIBUTES(global) SUBROUTINE solve_ini(c,dx,dy)
+IMPLICIT NONE
+
+INTEGER :: i, j, ii, jj, n(2)
+REAL, VALUE :: dx,  dy 
+REAL*8 :: c(:,:)
+
+i=(blockIdx%x-1)*blockDim%x+threadIdx%x
+j=(blockIdx%y-1)*blockDim%y+threadIdx%y
+n(1)=size(c,1)
+n(2)=size(c,2)
+
+IF (i<=n(1) .AND. j<=n(2)) THEN 
+  IF (i<=n(1)/2) ii=i-1
+  IF (i>n(1)/2)  ii=-n(1)+i-1
+  IF (j<=n(2)/2) jj=j-1
+  IF (j>n(2)/2)  jj=-n(2)+j-1
+  c(i,j)=1/((2*dcos(2.*pi*ii/dble(n(1)))-2)/dx**2+(2*dcos(2.*pi*jj/dble(n(2)))-2)/dy**2)
+ENDIF
+
+END SUBROUTINE solve_ini
+
+ATTRIBUTES(global) SUBROUTINE direct_solve(f,c)
+IMPLICIT NONE
+
+INTEGER :: i, j, n(2)
+COMPLEX*16 :: f(:,:)
+REAL*8 :: c(:,:)
+
+i=(blockIdx%x-1)*blockDim%x+threadIdx%x
+j=(blockIdx%y-1)*blockDim%y+threadIdx%y
+n(1)=size(f,1)
+n(2)=size(f,2)
+
+IF (i<=n(1) .AND. j<=n(2)) f(i,j)=f(i,j)*c(i,j)
+IF (i==1 .AND. j==1) f(i,j)=0.
+
+END SUBROUTINE direct_solve
+
+END MODULE solver
+
+! ===============================
+
+MODULE arakawa_j
+IMPLICIT NONE
+
+CONTAINS
+
+ATTRIBUTES(global) SUBROUTINE j7(zeta,psi,dzeta,dx,dy)
+IMPLICIT NONE
+
+REAL, VALUE :: dx, dy
+INTEGER :: n(2), i, j
+REAL :: zeta(:,:), psi(:,:), dzeta(:,:)
+
+i=(blockIdx%x-1)*blockDim%x+threadIdx%x
+j=(blockIdx%y-1)*blockDim%y+threadIdx%y
+n(1)=size(zeta,1)
+n(2)=size(zeta,2)
+
+IF (i>1 .AND. i<n(1) .AND. j>1 .AND. j<n(2)) &
+  dzeta(i,j)=(1./(3.*4.*dx*dy))*&
+            ( ((zeta(i+1,j)-zeta(i-1,j))*(psi(i,j+1)-psi(i,j-1)) &
+              -(zeta(i,j+1)-zeta(i,j-1))*(psi(i+1,j)-psi(i-1,j))) &
+            + ( psi(i,j+1)*(zeta(i+1,j+1)-zeta(i-1,j+1)) &
+               -psi(i,j-1)*(zeta(i+1,j-1)-zeta(i-1,j-1)) &
+               -psi(i+1,j)*(zeta(i+1,j+1)-zeta(i+1,j-1)) &
+               +psi(i-1,j)*(zeta(i-1,j+1)-zeta(i-1,j-1)) ) &
+            + ( zeta(i+1,j)*(psi(i+1,j+1)-psi(i+1,j-1)) &
+               -zeta(i-1,j)*(psi(i-1,j+1)-psi(i-1,j-1)) &
+               -zeta(i,j+1)*(psi(i+1,j+1)-psi(i-1,j+1)) &
+               +zeta(i,j-1)*(psi(i+1,j-1)-psi(i-1,j-1)) ) )
+
+END SUBROUTINE j7
+
+END MODULE arakawa_j
+
+
+! ===============================
+
+PROGRAM baro
+USE iso_c_binding
+USE cudafor
+USE ini
+USE cufft_m
+USE solver
+USE arakawa_j
+IMPLICIT NONE
+
+INTEGER, PARAMETER :: nx=512, ny=512
+REAL, PARAMETER :: dt=480., dx=50000., dy=50000.
+INTEGER :: i,j,k,m,n,o,t
+REAL :: dum1, dum2, dum3, dum4, dum5
+INTEGER :: t_end, t_out
+! host array (for output)
+REAL :: zeta(nx,ny), psi(nx,ny), u(nx,ny), v(nx,ny)
+! device array (calculation)
+REAL, DEVICE :: zeta_d(nx,ny), psi_d(nx,ny), temp_d(nx,ny)
+REAL, DEVICE :: dzeta_d(nx,ny,4) ! RK4
+COMPLEX*16, DEVICE :: zeta_c(nx-2,ny-2)
+REAL*8, DEVICE :: c(nx-2,ny-2)
+TYPE(dim3) :: grid, tblock
+TYPE(c_ptr) :: plan
+
+zeta=0.
+psi=0.
+
+t_end=18000
+t_out=180
+
+tblock=dim3(16,16,1)
+grid=dim3(ceiling(real(nx)/tblock%x),ceiling(real(ny)/tblock%y),1)
+
+zeta_d=zeta
+
+! initial condition
+call ic<<<grid,tblock>>>(zeta_d)
+call bc<<<grid,tblock>>>(zeta_d)
+
+! initial setup for cufft
+call solve_ini<<<grid,tblock>>>(c,dx,dy)
+call cufftPlan2D(plan,nx-2,ny-2,CUFFT_Z2Z)
+! solve inverse laplacian
+call r2c<<<grid,tblock>>>(zeta_d,zeta_c,1)
+call cufftExecZ2Z(plan,zeta_c,zeta_c,CUFFT_FORWARD)
+call direct_solve<<<grid,tblock>>>(zeta_c,c)
+call cufftExecZ2Z(plan,zeta_c,zeta_c,CUFFT_INVERSE)
+call c2r<<<grid,tblock>>>(zeta_c,psi_d,1)
+call times<<<grid,tblock>>>(psi_d,1./real((nx-2)*(ny-2)))
+call bc<<<grid,tblock>>>(psi_d)
+
+! open output file
+OPEN(10,FILE="test_data.dat",ACCESS="direct",RECL=nx*ny*2*4)
+n=1
+
+! integration
+DO t=0,t_end
+
+! output
+IF (mod(t,t_out)==0)THEN
+  write(*,*) "output time", t, n
+  ! copy zeta and psi from device to host
+  zeta=zeta_d
+  psi=psi_d
+  WRITE(10,REC=n) zeta, psi
+  n=n+1
+  !stop
+ENDIF
+
+
+dzeta_d=0.
+! first prediction
+call j7<<<grid,tblock>>>(zeta_d,psi_d,dzeta_d(:,:,1),dx,dy)
+temp_d=zeta_d
+!i = cudaDeviceSynchronize()
+call bc<<<grid,tblock>>>(temp_d)
+call update<<<grid,tblock>>>(temp_d,dzeta_d(:,:,1),0.5*dt)
+call r2c<<<grid,tblock>>>(temp_d,zeta_c,1)
+call cufftExecZ2Z(plan,zeta_c,zeta_c,CUFFT_FORWARD)
+call direct_solve<<<grid,tblock>>>(zeta_c,c)
+call cufftExecZ2Z(plan,zeta_c,zeta_c,CUFFT_INVERSE)
+call c2r<<<grid,tblock>>>(zeta_c,psi_d,1)
+call times<<<grid,tblock>>>(psi_d,1./real((nx-2)*(ny-2)))
+call bc<<<grid,tblock>>>(psi_d)
+
+! second prediction
+call j7<<<grid,tblock>>>(temp_d,psi_d,dzeta_d(:,:,2),dx,dy)
+temp_d=zeta_d
+call bc<<<grid,tblock>>>(temp_d)
+call update<<<grid,tblock>>>(temp_d,dzeta_d(:,:,2),0.5*dt)
+call r2c<<<grid,tblock>>>(temp_d,zeta_c,1)
+call cufftExecZ2Z(plan,zeta_c,zeta_c,CUFFT_FORWARD)
+call direct_solve<<<grid,tblock>>>(zeta_c,c)
+call cufftExecZ2Z(plan,zeta_c,zeta_c,CUFFT_INVERSE)
+call c2r<<<grid,tblock>>>(zeta_c,psi_d,1)
+call times<<<grid,tblock>>>(psi_d,1./real((nx-2)*(ny-2)))
+call bc<<<grid,tblock>>>(psi_d)
+
+! third prediction
+call j7<<<grid,tblock>>>(temp_d,psi_d,dzeta_d(:,:,3),dx,dy)
+temp_d=zeta_d
+call bc<<<grid,tblock>>>(temp_d)
+call update<<<grid,tblock>>>(temp_d,dzeta_d(:,:,3),dt)
+call r2c<<<grid,tblock>>>(temp_d,zeta_c,1)
+call cufftExecZ2Z(plan,zeta_c,zeta_c,CUFFT_FORWARD)
+call direct_solve<<<grid,tblock>>>(zeta_c,c)
+call cufftExecZ2Z(plan,zeta_c,zeta_c,CUFFT_INVERSE)
+call c2r<<<grid,tblock>>>(zeta_c,psi_d,1)
+call times<<<grid,tblock>>>(psi_d,1./real((nx-2)*(ny-2)))
+call bc<<<grid,tblock>>>(psi_d)
+
+! final prediction
+call j7<<<grid,tblock>>>(temp_d,psi_d,dzeta_d(:,:,4),dx,dy)
+
+! add tendency
+call rk4_update<<<grid,tblock>>>(zeta_d,dzeta_d,dt)
+call bc<<<grid,tblock>>>(zeta_d)
+call r2c<<<grid,tblock>>>(zeta_d,zeta_c,1)
+call cufftExecZ2Z(plan,zeta_c,zeta_c,CUFFT_FORWARD)
+call direct_solve<<<grid,tblock>>>(zeta_c,c)
+call cufftExecZ2Z(plan,zeta_c,zeta_c,CUFFT_INVERSE)
+call c2r<<<grid,tblock>>>(zeta_c,psi_d,1)
+call times<<<grid,tblock>>>(psi_d,1./real((nx-2)*(ny-2)))
+call bc<<<grid,tblock>>>(psi_d)
+
+ENDDO 
+
+call cudaProfilerStop()
+CLOSE(10)
+
+END PROGRAM baro
+
